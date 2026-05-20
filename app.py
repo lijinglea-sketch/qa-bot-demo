@@ -138,6 +138,8 @@ def render_references(chunks: list[dict]):
                 unsafe_allow_html=True
             )
 
+
+with tab_chat:
     # ── 渲染历史消息（倒序）
     for msg in reversed(st.session_state.messages):
         with st.chat_message(msg["role"]):
