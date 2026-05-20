@@ -38,21 +38,23 @@ def pull() -> bool:
         return False
     import urllib.request, urllib.error
     token, repo, branch = _cfg()
-    url = f"https://api.github.com/repos/{repo}/contents/{CHUNKS_PATH}?ref={branch}"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    })
+    # 用 raw URL 直接下载，避免 GitHub Contents API 1MB 大小限制
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{CHUNKS_PATH}"
+    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        content = base64.b64decode(data["content"].replace("\n", ""))
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+        # 写入前先验证是有效 JSON，避免用损坏文件覆盖本地好文件
+        json.loads(content)
         Path(CHUNKS_PATH).write_bytes(content)
         return True
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return False  # 文件还不存在，用本地默认值
-        print(f"[github_sync] pull failed: {e}")
+            return False
+        print(f"[github_sync] pull failed: HTTP {e.code}")
+        return False
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[github_sync] pulled file is not valid JSON: {e}")
         return False
     except Exception as e:
         print(f"[github_sync] pull error: {e}")
