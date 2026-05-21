@@ -11,7 +11,17 @@ from knowledge_base import KnowledgeBase
 import github_sync
 
 COOPER_DOC_URL = "https://cooper.didichuxing.com/didocs/2207954380581"
-VISION_MODEL   = "moonshot-v1-32k"
+# 视觉模型：在 .streamlit/secrets.toml 中配置 VISION_MODEL = "模型名"
+# Kimi 视觉模型参考：moonshot-v1-8k-vision-preview / kimi-vl-a3b-thinking
+# 若不配置则默认尝试 moonshot-v1-8k-vision-preview，失败自动降级为纯文字
+def _get_vision_model():
+    try:
+        import streamlit as _st
+        return _st.secrets.get("VISION_MODEL", "moonshot-v1-8k-vision-preview")
+    except Exception:
+        return "moonshot-v1-8k-vision-preview"
+
+VISION_MODEL = _get_vision_model()
 
 st.set_page_config(
     page_title="工艺规范答疑助手",
@@ -225,75 +235,119 @@ with tab_chat:
             image_blocks = [
                 {"type": "image_url", "image_url": {"url": uri}} for uri in images
             ]
+            vision_ok = True  # 标记视觉是否成功
 
             with new_msg_slot:
                 with st.chat_message("assistant"):
-                    # Step 1：识别场景，提取检索词
-                    with st.status("识别图像内容…", expanded=False) as s1:
-                        resp1 = client.chat.completions.create(
-                            model=VISION_MODEL, max_tokens=400,
-                            messages=[
-                                {"role": "system", "content": VISION_STEP1_PROMPT},
-                                {"role": "user", "content": image_blocks + [{
-                                    "type": "text",
-                                    "text": "分析图片场景。" + (f"用户补充说明：{user_text}" if user_text else "")
-                                }]}
-                            ]
+                    try:
+                        # Step 1：识别场景，提取检索词
+                        with st.status("识别图像内容…", expanded=False) as s1:
+                            resp1 = client.chat.completions.create(
+                                model=VISION_MODEL, max_tokens=400,
+                                messages=[
+                                    {"role": "system", "content": VISION_STEP1_PROMPT},
+                                    {"role": "user", "content": image_blocks + [{
+                                        "type": "text",
+                                        "text": "分析图片场景。" + (f"用户补充说明：{user_text}" if user_text else "")
+                                    }]}
+                                ]
+                            )
+                            raw1 = resp1.choices[0].message.content.strip()
+                            try:
+                                m     = re.search(r'\{.*\}', raw1, re.DOTALL)
+                                step1 = json.loads(m.group()) if m else {}
+                            except Exception:
+                                step1 = {"scene_desc": raw1, "keywords": [], "data_issues": None}
+                            s1.update(label="✅ 图像识别完成", state="complete")
+
+                        scene_desc  = step1.get("scene_desc", "")
+                        keywords    = step1.get("keywords", [])
+                        data_issues = step1.get("data_issues")
+
+                        # Step 2：检索知识库
+                        with st.status("检索相关工艺规范…", expanded=False) as s2:
+                            search_q = " ".join(keywords) + (" " + user_text if user_text else "")
+                            results  = kb.search(search_q.strip() or scene_desc, top_k=5)
+                            s2.update(label=f"✅ 找到 {len(results)} 条相关规范", state="complete")
+
+                        # Step 3：综合推理
+                        with st.status("生成制作建议…", expanded=False) as s3:
+                            context = "\n\n---\n\n".join(
+                                f"[{i}] {r['path']}\n{r['content_text']}"
+                                for i, r in enumerate(results, 1)
+                            )
+                            agent_prompt = VISION_AGENT_PROMPT.format(
+                                scene_desc=scene_desc,
+                                data_issues_text=f"\n**当前数据问题**：{data_issues}" if data_issues else "",
+                                n=len(results),
+                                context=context,
+                                user_question_text=f"\n**用户问题**：{user_text}\n" if user_text else ""
+                            )
+                            resp2 = client.chat.completions.create(
+                                model=VISION_MODEL, max_tokens=1500,
+                                messages=[{"role": "user", "content": image_blocks + [
+                                    {"type": "text", "text": agent_prompt}
+                                ]}]
+                            )
+                            answer = resp2.choices[0].message.content.strip()
+                            s3.update(label="✅ 分析完成", state="complete")
+
+                        cited_nums = sorted(set(int(n) for n in re.findall(r'\[(\d+)\]', answer)))
+                        ref_chunks = [results[n-1] for n in cited_nums if 1 <= n <= len(results)]
+
+                        if keywords:
+                            kw_html = " ".join(f'<span class="kw-chip">{k}</span>' for k in keywords)
+                            st.markdown(f"🔍 {kw_html}", unsafe_allow_html=True)
+                        st.markdown(answer)
+                        if ref_chunks:
+                            render_references(ref_chunks)
+
+                        st.session_state.messages.append({
+                            "role": "assistant", "content": answer,
+                            "keywords": keywords, "ref_chunks": ref_chunks
+                        })
+
+                    except Exception as vision_err:
+                        # 视觉模型不可用，降级为纯文字问答
+                        vision_ok = False
+                        st.warning(
+                            f"⚠️ 图像分析不可用（模型 `{VISION_MODEL}` 不支持视觉输入），"
+                            f"已切换为纯文字问答。\n\n"
+                            f"**解决方法**：在 `.streamlit/secrets.toml` 中配置 `VISION_MODEL = \"正确的视觉模型名\"`"
                         )
-                        raw1 = resp1.choices[0].message.content.strip()
-                        try:
-                            m     = re.search(r'\{.*\}', raw1, re.DOTALL)
-                            step1 = json.loads(m.group()) if m else {}
-                        except Exception:
-                            step1 = {"scene_desc": raw1, "keywords": [], "data_issues": None}
-                        s1.update(label="✅ 图像识别完成", state="complete")
 
-                    scene_desc  = step1.get("scene_desc", "")
-                    keywords    = step1.get("keywords", [])
-                    data_issues = step1.get("data_issues")
-
-                    # Step 2：检索知识库
-                    with st.status("检索相关工艺规范…", expanded=False) as s2:
-                        search_q = " ".join(keywords) + (" " + user_text if user_text else "")
-                        results  = kb.search(search_q.strip() or scene_desc, top_k=5)
-                        s2.update(label=f"✅ 找到 {len(results)} 条相关规范", state="complete")
-
-                    # Step 3：综合推理
-                    with st.status("生成制作建议…", expanded=False) as s3:
-                        context = "\n\n---\n\n".join(
-                            f"[{i}] {r['path']}\n{r['content_text']}"
-                            for i, r in enumerate(results, 1)
-                        )
-                        agent_prompt = VISION_AGENT_PROMPT.format(
-                            scene_desc=scene_desc,
-                            data_issues_text=f"\n**当前数据问题**：{data_issues}" if data_issues else "",
-                            n=len(results),
-                            context=context,
-                            user_question_text=f"\n**用户问题**：{user_text}\n" if user_text else ""
-                        )
-                        resp2 = client.chat.completions.create(
-                            model=VISION_MODEL, max_tokens=1500,
-                            messages=[{"role": "user", "content": image_blocks + [
-                                {"type": "text", "text": agent_prompt}
-                            ]}]
-                        )
-                        answer = resp2.choices[0].message.content.strip()
-                        s3.update(label="✅ 分析完成", state="complete")
-
-                    cited_nums = sorted(set(int(n) for n in re.findall(r'\[(\d+)\]', answer)))
-                    ref_chunks = [results[n-1] for n in cited_nums if 1 <= n <= len(results)]
-
-                    if keywords:
-                        kw_html = " ".join(f'<span class="kw-chip">{k}</span>' for k in keywords)
-                        st.markdown(f"🔍 {kw_html}", unsafe_allow_html=True)
-                    st.markdown(answer)
-                    if ref_chunks:
-                        render_references(ref_chunks)
-
-            st.session_state.messages.append({
-                "role": "assistant", "content": answer,
-                "keywords": keywords, "ref_chunks": ref_chunks
-            })
+            # 视觉失败时，把图片附加说明当文字问答继续处理
+            if not vision_ok and user_text:
+                images = []  # 清空图片，走文字分支
+                # 把"用户上传了图片"写入问题上下文
+                user_text_with_note = f"{user_text}\n\n（用户同时上传了 {len(image_blocks)} 张图片，但图像分析暂不可用）"
+                results = kb.search(user_text, top_k=5)
+                context = "\n\n---\n\n".join(
+                    f"[{i}] 章节：{r['path']}\n{r['content_text']}"
+                    for i, r in enumerate(results, 1)
+                )
+                with new_msg_slot:
+                    with st.chat_message("assistant"):
+                        with st.spinner("查阅规范中…"):
+                            response = client.chat.completions.create(
+                                model="moonshot-v1-32k", max_tokens=1024,
+                                messages=[
+                                    {"role": "system", "content": SYSTEM_PROMPT},
+                                    {"role": "user", "content": f"参考资料：\n\n{context}\n\n---\n\n问题：{user_text_with_note}"}
+                                ]
+                            )
+                        raw_answer = response.choices[0].message.content
+                        confidence = "低" if (any(kw in raw_answer for kw in LOW_CONF_KEYWORDS) or "[置信度：低]" in raw_answer) else "高"
+                        clean      = re.sub(r'\[置信度[：:][高低]\]', '', raw_answer).strip()
+                        cited_nums = sorted(set(int(n) for n in re.findall(r'\[(\d+)\]', clean)))
+                        ref_chunks = [results[n-1] for n in cited_nums if 1 <= n <= len(results)]
+                        st.markdown(clean)
+                        if ref_chunks:
+                            render_references(ref_chunks)
+                st.session_state.messages.append({
+                    "role": "assistant", "content": clean,
+                    "confidence": confidence, "ref_chunks": ref_chunks
+                })
 
         # ── 无图片：普通问答 ───────────────────────────────
         else:
