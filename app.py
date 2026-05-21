@@ -11,15 +11,13 @@ from knowledge_base import KnowledgeBase
 import github_sync
 
 COOPER_DOC_URL = "https://cooper.didichuxing.com/didocs/2207954380581"
-# 视觉模型：在 .streamlit/secrets.toml 中配置 VISION_MODEL = "模型名"
-# Kimi 视觉模型参考：moonshot-v1-8k-vision-preview / kimi-vl-a3b-thinking
-# 若不配置则默认尝试 moonshot-v1-8k-vision-preview，失败自动降级为纯文字
+# 视觉模型：支持图片输入，可在 secrets.toml 中用 VISION_MODEL 覆盖
 def _get_vision_model():
     try:
         import streamlit as _st
-        return _st.secrets.get("VISION_MODEL", "moonshot-v1-8k-vision-preview")
+        return _st.secrets.get("VISION_MODEL", "moonshot-v1-32k-vision-preview")
     except Exception:
-        return "moonshot-v1-8k-vision-preview"
+        return "moonshot-v1-32k-vision-preview"
 
 VISION_MODEL = _get_vision_model()
 
